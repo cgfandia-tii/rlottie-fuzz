@@ -1,0 +1,6 @@
+[submodule "Angora"]
+	path = Angora
+	url = git@github.com:AngoraFuzzer/Angora.git
+[submodule "rlottie"]
+	path = rlottie
+	url = git@github.com:desktop-app/rlottie.git
