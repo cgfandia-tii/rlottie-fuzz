@@ -2,5 +2,5 @@
 	path = Angora
 	url = git@github.com:AngoraFuzzer/Angora.git
 [submodule "rlottie"]
-	path = rlottie
+	path = executor/rlottie
 	url = git@github.com:desktop-app/rlottie.git

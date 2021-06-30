@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+import argparse
+import subprocess
+import re
+import logging
+import json
+import shutil
+import xml.etree.ElementTree as etree
+from os import path, listdir, mkdir
+from collections import namedtuple
+from multiprocessing.pool import ThreadPool as Pool
+
+
+logging.basicConfig(format='[%(levelname)s] %(message)s', level=logging.INFO)
+LOGGER = logging.getLogger('crash_triage')
+Frame = namedtuple('Frame', ['file', 'line', 'func'])
+
+# Retries on each input if there is no crash
+ASAN_RETRIES = 10
+HANG_TIMEOUT = 60
+# Stack frames count to compare
+STACK_THRESHOLD = 4
+
+
+class Crash(object):
+    def __init__(self, filename=None, text=None):
+        super().__init__()
+        self._filename = filename
+        self._stack = None
+        self._kind = None
+        self._what = None
+
+        if filename:
+            with open(filename, 'rt') as file:
+                self._parse(file.readlines())
+        else:
+            self._parse(text.splitlines())
+
+    def _parse(self, filename):
+        raise NotImplementedError()
+
+    @property
+    def origin(self):
+        return self._filename
+
+    @property
+    def stack(self):
+        return self._stack
+
+    @property
+    def kind(self):
+        return self._kind
+
+    @property
+    def what(self):
+        return self._what
+
+    @property
+    def where(self):
+        if self.stack:
+            return self.stack[0]
+        return None
+
+    @property
+    def significant_stack(self):
+        if self.stack:
+            return self.stack[:STACK_THRESHOLD]
+        return None
+
+    @property
+    def json(self):
+        return json.dumps({
+            'origin': self.origin,
+            'kind': self.kind,
+            'what': self.what,
+            'stack': self.get_pretty_stack()
+        }, indent=4)
+
+    def get_pretty_stack(self):
+        return ['%s:%s:%s' % (frame.file, frame.func, frame.line) for frame in self.stack]
+
+    def __repr__(self):
+        return '<Crash %s by %s at %s>' % (self.kind, self.what, self.where)
+
+    def __hash__(self):
+        return hash(tuple([self.kind, self.what, self.where] + self.significant_stack))
+
+    def __eq__(self, other):
+        return self.significant_stack == other.significant_stack and self.kind == other.kind and self.what == other.what
+
+
+class ValgrindCrash(Crash):
+    def __init__(self, filename):
+        super().__init__(filename)
+
+    def _parse(self, lines):
+        tree = etree.fromstringlist(lines)
+
+        for error in tree.findall('fatal_signal'):
+            kind = error.findtext('signame')
+            self._kind = kind
+            if not self._kind:
+                LOGGER.warning('Failed to get kind of crash from %s' % path.basename(self.origin))
+                self._kind = str(self._kind)
+
+            self._what = error.findtext('event')
+            if not self._what:
+                LOGGER.warning('Failed to get what of crash from %s' % path.basename(self.origin))
+                self._what = str(self._what)
+
+            stack = error.findall('stack')[0]
+            frames = [Frame(frame.findtext("file"), frame.findtext("line"), frame.findtext("fn"))
+                      for frame in stack.findall('frame')]
+
+            self._stack = frames
+
+        if not self._stack or len(self._stack) == 0:
+            raise Exception('Unable to find crash call stack')
+
+
+class AsanCrash(Crash):
+    def __init__(self, filename):
+        super().__init__(filename)
+
+    def _parse(self, lines):
+        # #1 0x5f80e3 in LottieParserImpl::parseGroupObject() .../rlottie/src/lottie/lottieparser.cpp:1111
+        frame_re = re.compile(r'#\d+ \w+ in ([^\/]+) (.+)$')
+        # ==123893==ERROR: AddressSanitizer: SEGV on unknown address 0x000000000000 (pc 0x0000005f80e4 bp 0x7ffca0dd3a50 sp 0x7ffca0dd38e0 T0)
+        # ==123918==ERROR: AddressSanitizer: heap-use-after-free on address 0x606000000e90 at pc 0x0000005e5777 bp 0x7ffe10759430 sp 0x7ffe10759428 WRITE of size 4 at 0x606000000e90 thread T0
+        kind_re = re.compile(r'==\d+==ERROR: AddressSanitizer: (\S+)')
+        what_re = re.compile(r'^(READ|WRITE) of size \d+')
+        what_re_2 = re.compile(r'caused by a (\S+)')
+        stack = []
+        for line in lines:
+            frame_found = frame_re.search(line)
+            kind_found = kind_re.search(line)
+            what_found = what_re.search(line)
+            if not what_found:
+                what_found = what_re_2.search(line)
+
+            if frame_found:
+                func, file = frame_found.group(1), frame_found.group(2)
+                file = path.basename(file.strip('()'))
+                file_line = file.split(':')
+                if len(file_line) > 1:
+                    file, line = file_line[0], file_line[1]
+                    stack.append(Frame(file, line, func))
+
+            if kind_found:
+                self._kind = kind_found.group(1)
+
+            if what_found:
+                self._what = what_found.group(1)
+
+        self._stack = stack
+
+        if not self._stack or len(self._stack) == 0:
+            raise Exception('Unable to find crash call stack')
+
+        if not self._kind:
+            raise Exception('Unable to find "kind"')
+
+        if not self._what:
+            raise Exception('Unable to find "what"')
+
+
+class Triage(object):
+    def __init__(self, input, output, asan=None, valgrind=None, *args):
+        self._input_folder = path.abspath(input)
+        if not path.exists(self._input_folder) or path.isfile(self._input_folder):
+            raise FileNotFoundError('Input folder does not exist')
+        self._output_folder = path.abspath(output)
+        if path.exists(self._output_folder):
+            raise Exception('Output %s already exist' % self._output_folder)
+        self._asan = None
+        self._valgrind = None
+
+        if asan:
+            self._asan = path.abspath(asan)
+            if not path.isfile(self._asan):
+                raise FileNotFoundError('asan binary does not exist')
+            self._asan_folder = path.join(self._output_folder, 'asan')
+        if valgrind:
+            self._valgrind = path.abspath(valgrind)
+            if not path.isfile(self._valgrind):
+                raise FileNotFoundError('valgrind binary does not exist')
+            self._valgrind_folder = path.join(self._output_folder, 'valgrind')
+
+        if not self._asan and not self._valgrind:
+            raise Exception('Not asan or valgrind executable specified')
+
+        self._unique_folder = path.join(self._output_folder, 'unique')
+
+        mkdir(self._output_folder)
+        mkdir(self._asan_folder)
+        mkdir(self._valgrind_folder)
+        mkdir(self._unique_folder)
+        self._args = list(args)
+
+    @staticmethod
+    def _run(start_process_func, crash_handler, out_file, args):
+        try:
+            start_process_func(out_file, args)
+            LOGGER.warning('%s is not crash' % path.basename(out_file))
+            return None
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            try:
+                LOGGER.info('%s crash!' % path.basename(out_file))
+                return crash_handler(out_file)
+            except Exception as e:
+                LOGGER.error('Failed to parse %s: %s' % (path.basename(out_file), str(e)))
+                return None
+
+    @staticmethod
+    def _run_asan(out_file, args):
+        for _ in range(ASAN_RETRIES):
+            with open(out_file, 'wt') as asan_out:
+                subprocess.run(args, check=True, stderr=asan_out, timeout=HANG_TIMEOUT)
+
+    @staticmethod
+    def _run_valgrind(out_file, args):
+        valgrind_args = ['valgrind', '--xml=yes', '--xml-file=%s' % out_file] + args
+        subprocess.run(valgrind_args, check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=HANG_TIMEOUT)
+
+    @staticmethod
+    def _get_asan_crash(filename):
+        return AsanCrash(filename)
+
+    @staticmethod
+    def _get_valgrind_crash(filename):
+        return ValgrindCrash(filename)
+
+    @staticmethod
+    def _parallel_run(start_process_func, crash_handler, out_files, args_list):
+        pool = Pool()
+        args = [(start_process_func, crash_handler, out_file, arg) for out_file, arg in zip(out_files, args_list)]
+        return pool.starmap(Triage._run, args)
+
+    def _get_crash_abs_paths(self, root, extension=''):
+        return [path.join(root, f + extension)
+                for f in listdir(self._input_folder) if path.isfile(path.join(self._input_folder, f))]
+
+    def _scan(self, target, inputs, out_folder, report_extension, start_process, crash_handler):
+        args = [[target] + self._args + [input] for input in inputs]
+        crash_outputs = self._get_crash_abs_paths(out_folder, report_extension)
+        return Triage._parallel_run(start_process, crash_handler, crash_outputs, args)
+
+    def unique_crashes(self):
+        all_inputs = self._get_crash_abs_paths(self._input_folder)
+
+        if self._asan:
+            crashes = self._scan(self._asan,
+                                 all_inputs,
+                                 self._asan_folder,
+                                 '.asan',
+                                 Triage._run_asan,
+                                 Triage._get_asan_crash)
+        else:
+            crashes = self._scan(self._valgrind,
+                                 all_inputs,
+                                 self._valgrind_folder,
+                                 '.valgrind.xml',
+                                 Triage._run_valgrind,
+                                 Triage._get_valgrind_crash)
+
+        bypassed_inputs = []
+        for input, crash in zip(all_inputs, crashes):
+            if not crash:
+                bypassed_inputs.append(input)
+
+        new_crashes = []
+        if self._asan and self._valgrind:
+            new_crashes = self._scan(self._valgrind,
+                                     bypassed_inputs,
+                                     self._valgrind_folder,
+                                     '.valgrind.xml',
+                                     Triage._run_valgrind,
+                                     Triage._get_valgrind_crash)
+
+        return set(filter(lambda crash: crash, crashes + new_crashes))
+
+    def write_crashes(self, crashes):
+        for crash in crashes:
+            report_name = \
+                '%s:%s:%s' % (crash.kind.replace(" ", "_"), crash.what.replace(" ", "_"), path.basename(crash.origin))
+            shutil.copy(crash.origin, path.join(self._unique_folder, report_name))
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Triage of the Angora crashes')
+    parser.add_argument('--input', '-i', help='Folder with crash inputs')
+    parser.add_argument('--output', '-o', help='Folder with triage crashes')
+    parser.add_argument('--asan', '-a', help='Path to ASAN binary', default=None)
+    parser.add_argument('--valgrind', '-v', help='Path to Valgrind binary', default=None)
+
+    args = parser.parse_args()
+    triage = Triage(args.input, args.output, args.asan, args.valgrind)
+    crashes = triage.unique_crashes()
+    triage.write_crashes(crashes)
