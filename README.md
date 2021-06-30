@@ -2,7 +2,7 @@
 Fuzzer for the rlottie library fork of Telegram messenger. Aimed at finding bugs in parsing and rendering of lottie stickers.
 
 ## Usage
-Fuzzing and triage are performing in `rlottie-fuzz` docker container which is built with a simple `build.sh` script. Initial input corpus can be gathered [here](executor/rlottie/example/resource).
+Fuzzing and triage are performing in `rlottie-fuzz` docker container which is built with a simple `build.sh` script. Initial input corpus can be gathered [here](https://github.com/desktop-app/rlottie/tree/cbd43984ebdf783e94c8303c41385bf82aa36d5b/example/resource).
 
 ### Fuzzing
 Initial fuzzing
